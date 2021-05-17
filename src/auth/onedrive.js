@@ -8,17 +8,15 @@ export async function getAccessToken() {
     return Math.floor(Date.now() / 1000)
   }
 
-  // Fetch access token from Google Firebase Database
-  const data = await (await fetch(`${config.firebase_url}?auth=${FIREBASE_TOKEN}`)).json()
+  // Fetch access token
+  const data = await BUCKET.get('onedrive', 'json')
   if (data && data.access_token && timestamp() < data.expire_at) {
     console.log('Fetched token from storage.')
     return data.access_token
   }
 
   // Token expired, refresh access token with Microsoft API. Both international and china-specific API are supported
-  const oneDriveAuthEndpoint = config.useOneDriveCN
-    ? 'https://login.chinacloudapi.cn/common/oauth2/v2.0/token'
-    : 'https://login.microsoftonline.com/common/oauth2/v2.0/token'
+  const oneDriveAuthEndpoint = `${config.apiEndpoint.auth}/token`
 
   const resp = await fetch(oneDriveAuthEndpoint, {
     method: 'POST',
@@ -32,17 +30,11 @@ export async function getAccessToken() {
     console.info('Successfully refreshed access_token.')
     const data = await resp.json()
 
-    // Update expiration time at Google Firebase on token refresh
+    // Update expiration time on token refresh
     data.expire_at = timestamp() + data.expires_in
 
-    const store = await fetch(`${config.firebase_url}?auth=${FIREBASE_TOKEN}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-      headers: {
-        'content-type': 'application/json'
-      }
-    })
-    console.log(store.status)
+    await BUCKET.put('onedrive', JSON.stringify(data))
+    console.info('Successfully updated access_token.')
 
     // Finally, return access token
     return data.access_token
@@ -50,4 +42,26 @@ export async function getAccessToken() {
     // eslint-disable-next-line no-throw-literal
     throw `getAccessToken error ${JSON.stringify(await resp.text())}`
   }
+}
+
+/**
+ * Get & store siteID for finding sharepoint resources
+ *
+ * @param {string} accessToken token for accessing graph API
+ */
+export async function getSiteID(accessToken) {
+  let data = await BUCKET.get('sharepoint', 'json')
+  if (!data) {
+    const resp = await fetch(`${config.apiEndpoint.graph}${config.baseResource}?$select=id`, {
+      headers: {
+        Authorization: `bearer ${accessToken}`
+      }
+    })
+    if (resp.ok) {
+      data = await resp.json()
+      console.log('Got & stored site-id.')
+      await BUCKET.put('sharepoint', JSON.stringify({ id: data.id }))
+    }
+  }
+  return data.id
 }

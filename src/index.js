@@ -1,7 +1,7 @@
 import config from './config/default'
-import { AUTH_ENABLED, NAME, PASS } from './auth/config'
+import { AUTH_ENABLED, NAME, ENABLE_PATHS } from './auth/config'
 import { parseAuthHeader, unauthorizedResponse } from './auth/credentials'
-import { getAccessToken } from './auth/onedrive'
+import { getAccessToken, getSiteID } from './auth/onedrive'
 import { handleFile, handleUpload } from './files/load'
 import { extensions } from './render/fileExtension'
 import { renderFolderView } from './folderView'
@@ -14,10 +14,20 @@ addEventListener('fetch', event => {
 async function handle(request) {
   if (AUTH_ENABLED === false) {
     return handleRequest(request)
-  } else if (AUTH_ENABLED === true) {
-    const credentials = parseAuthHeader(request.headers.get('Authorization'))
-    if (!credentials || credentials.name !== NAME || credentials.pass !== PASS) {
-      return unauthorizedResponse('Unauthorized')
+  }
+
+  if (AUTH_ENABLED === true) {
+    const pathname = decodeURIComponent(new URL(request.url).pathname).toLowerCase()
+    const privatePaths = ENABLE_PATHS.map(i => i.toLowerCase())
+
+    if (privatePaths.filter(p => pathname.toLowerCase().startsWith(p)).length > 0 || /__Lock__/gi.test(pathname)) {
+      const credentials = parseAuthHeader(request.headers.get('Authorization'))
+
+      if (!credentials || credentials.name !== NAME || credentials.pass !== AUTH_PASSWORD) {
+        return unauthorizedResponse('Unauthorized')
+      }
+
+      return handleRequest(request)
     } else {
       return handleRequest(request)
     }
@@ -28,15 +38,22 @@ async function handle(request) {
 
 // Cloudflare cache instance
 const cache = caches.default
+const base = encodeURI(config.base).replace(/\/$/, '')
 
 /**
  * Format and regularize directory path for OneDrive API
  *
  * @param {string} pathname The absolute path to file
+ * @param {boolean} isRequestFolder is indexing folder or not
  */
-function wrapPathName(pathname) {
-  pathname = encodeURI(config.base) + (pathname === '/' ? '' : pathname)
-  return pathname === '/' || pathname === '' ? '' : ':' + pathname
+function wrapPathName(pathname, isRequestFolder) {
+  pathname = base + pathname
+  const isIndexingRoot = pathname === '/'
+  if (isRequestFolder) {
+    if (isIndexingRoot) return ''
+    return `:${pathname.replace(/\/$/, '')}:`
+  }
+  return `:${pathname}`
 }
 
 async function handleRequest(request) {
@@ -45,21 +62,24 @@ async function handleRequest(request) {
     if (maybeResponse) return maybeResponse
   }
 
-  const base = encodeURI(config.base)
   const accessToken = await getAccessToken()
+  if (config.type.driveType) {
+    config.baseResource = `/sites/${await getSiteID(accessToken)}/drive`
+  }
 
   const { pathname, searchParams } = new URL(request.url)
   const neoPathname = pathname.replace(/pagination$/, '')
+  const isRequestFolder = pathname.endsWith('/') || searchParams.get('page')
 
-  const rawImage = searchParams.get('raw')
+  const rawFile = searchParams.get('raw') !== null
   const thumbnail = config.thumbnail ? searchParams.get('thumbnail') : false
   const proxied = config.proxyDownload ? searchParams.get('proxied') !== null : false
 
-  const oneDriveApiEndpoint = config.useOneDriveCN ? 'microsoftgraph.chinacloudapi.cn' : 'graph.microsoft.com'
-
   if (thumbnail) {
-    const url = `https://${oneDriveApiEndpoint}/v1.0/me/drive/root:${base +
-      (pathname === '/' ? '' : pathname)}:/thumbnails/0/${thumbnail}/content`
+    const url = `${config.apiEndpoint.graph}${config.baseResource}/root${wrapPathName(
+      neoPathname,
+      isRequestFolder
+    )}:/thumbnails/0/${thumbnail}/content`
     const resp = await fetch(url, {
       headers: {
         Authorization: `bearer ${accessToken}`
@@ -71,17 +91,19 @@ async function handleRequest(request) {
     })
   }
 
-  const isRequestFolder = pathname.endsWith('/') || searchParams.get('page')
-  const childrenApi =
-    `https://${oneDriveApiEndpoint}/v1.0/me/drive/root${wrapPathName(neoPathname.replace(/\/$/, ''))}:/children` +
-    (config.pagination.enable && config.pagination.top ? `?$top=${config.pagination.top}` : ``)
-  // using different api to handle file or folder: children or driveItem
-  let url = isRequestFolder ? childrenApi : `https://${oneDriveApiEndpoint}/v1.0/me/drive/root${wrapPathName(pathname)}`
+  let url = `${config.apiEndpoint.graph}${config.baseResource}/root${wrapPathName(neoPathname, isRequestFolder)}${
+    isRequestFolder
+      ? '/children' + (config.pagination.enable && config.pagination.top ? `?$top=${config.pagination.top}` : '')
+      : '?select=%40microsoft.graph.downloadUrl,name,size,file'
+  }`
+
   // get & set {pLink ,pIdx} for fetching and paging
   const paginationLink = request.headers.get('pLink')
   const paginationIdx = request.headers.get('pIdx') - 0
 
-  if (paginationLink && paginationLink !== 'undefined') url = `${childrenApi}&$skiptoken=${paginationLink}`
+  if (paginationLink && paginationLink !== 'undefined') {
+    url += `&$skiptoken=${paginationLink}`
+  }
 
   const resp = await fetch(url, {
     headers: {
@@ -93,12 +115,11 @@ async function handleRequest(request) {
   if (resp.ok) {
     const data = await resp.json()
     if (data['@odata.nextLink']) {
-      request.pIdx = paginationIdx ? paginationIdx : 1
+      request.pIdx = paginationIdx || 1
       request.pLink = data['@odata.nextLink'].match(/&\$skiptoken=(.+)/)[1]
     } else if (paginationIdx) {
       request.pIdx = -paginationIdx
     }
-
     if ('file' in data) {
       // Render file preview view or download file directly
       const fileExt = data.name
@@ -106,15 +127,21 @@ async function handleRequest(request) {
         .pop()
         .toLowerCase()
 
-      // Render image directly if ?raw=true parameters are given
-      if (rawImage || !(fileExt in extensions)) {
+      // Render file directly if url params 'raw' are given
+      if (rawFile || !(fileExt in extensions)) {
         return await handleFile(request, pathname, data['@microsoft.graph.downloadUrl'], {
           proxied,
           fileSize: data.size
         })
       }
 
-      return new Response(await renderFilePreview(data, pathname, fileExt), {
+      // Add preview by CloudFlare worker cache feature
+      let cacheUrl = null
+      if (config.cache.enable && config.cache.previewCache && data.size < config.cache.chunkedCacheLimit) {
+        cacheUrl = request.url + '?proxied&raw'
+      }
+
+      return new Response(await renderFilePreview(data, pathname, fileExt, cacheUrl || null), {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'content-type': 'text/html'
@@ -153,7 +180,7 @@ async function handleRequest(request) {
   if (error) {
     const body = JSON.stringify(error)
     switch (error.code) {
-      case 'ItemNotFound':
+      case 'itemNotFound':
         return new Response(body, {
           status: 404,
           headers: {
